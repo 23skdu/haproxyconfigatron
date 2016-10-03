@@ -1,0 +1,64 @@
+#!/usr/bin/perl -w
+use strict;
+use Net::DNS;
+my $svc='haproxy-cfg';
+my $header="$svc.header.tmpl";
+my $outputfilename="/var/www/html/$svc/haproxy.cfg";
+#$svroot is the zone delegate to hold service discovery data
+my $service_root=$svcroot;
+#Each service should have its own zone, with the name of the service being the primary SRV RRset to lookup
+my $service_uri="$svc.$svc.$service_root";
+my $configstring='';
+my ( $option_string, $httpchk_port, $id, @outputlines, @output_dynamic);
+
+#Request config
+my $reqconf = Net::DNS::Resolver->new();
+my $haproxy_cfg_data = $reqconf->query($service_uri, 'TXT');
+if ( $haproxy_cfg_data )
+{ foreach my $rr ( $haproxy_cfg_data->answer ) { $configstring = join $configstring,$rr->txtdata; };
+} else { print "lookupfail:".$reqconf->errorstring; }
+
+#Parse the configstring into an array of tuples
+my @tuples = ( $configstring =~ /\([^)]*\)/g );
+foreach my $cfg(@tuples) { $cfg =~ s/^.(.*).$/$1/;
+        my ($front_name,$front_port,$back_clustername,$options) = split /,/, $cfg;
+        if ($options) {     ($option_string,$httpchk_port) = split /:/, $options;
+                 $option_string="  option ".$option_string."\n";
+                         $httpchk_port = " port ".$httpchk_port; }
+                 else { $option_string=''; $httpchk_port = ''; }
+                #Special Handling For Shared Backends for pg write cluster
+        if ($front_name =~ m/\:/) { my ($front1,$front2) = split /:/, $front_name;
+                       my ($port1,$port2) = split /:/, $front_port;
+        push @output_dynamic, "\nfrontend $front1\n  bind *:$port1\n  default_backend $back_clustername\n".
+        "frontend $front2\n  bind *:$port2\n  default_backend $back_clustername\n";
+        } else {         
+                push @output_dynamic, "\nfrontend $front_name\n  bind *:$front_port\n  default_backend $back_clustername\n"; }
+                push @output_dynamic, "backend $back_clustername\n$option_string".
+        "  balance first\n";
+        #Lookup SRV records
+        $id=0;
+                my $srv_req = Net::DNS::Resolver->new();
+                my $srv_records = $srv_req->query("$back_clustername.$back_clustername.$service_root", 'SRV');
+                my @records = $srv_records->answer;
+                foreach my $srv_entries(@records) { ++$id;
+                my $servername = $srv_entries->target;
+                my $serverport = $srv_entries->port;
+                my $maxconn = $srv_entries->weight;
+                   my $ip_req = Net::DNS::Resolver->new();
+                   my $ip_addr = $ip_req->search($srv_entries->target);
+                   my @rr = $ip_addr->answer;
+                   my $ip = $rr[0]->address;
+                push @output_dynamic, "  server $servername    $ip:$serverport maxconn $maxconn check$httpchk_port inter 4000 rise 3 fall 3 id $id\n";
+        }
+};
+
+open(my $fh, '<:encoding(UTF-8)', $header) || die "openfail $header $!";
+while (my $row = <$fh>) {
+  push @outputlines, $row;
+}
+close $fh;
+#Combine the header and the dynamic lines
+push @outputlines, @output_dynamic;
+open(my $cfgout, '>', $outputfilename) || die "openfail $outputfilename $!";
+print $cfgout @outputlines;
+close $cfgout;
